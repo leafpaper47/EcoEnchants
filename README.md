@@ -45,10 +45,10 @@
 </p>
 
 
-[![标题](https://i.imgur.com/3GMumz3.png)]()
-[![Features](https://i.imgur.com/vmSISa6.png)]()
-[![文档](https://i.imgur.com/uS2O3ll.png)](https://plugins.auxilor.io/ecoenchants/all-enchantments)
-[![Compatibility](https://i.imgur.com/MxiF57Z.png)]()
+[![标题](https://free.picui.cn/free/4756/2026/09/14/6aa6d76305f2d.jpg)]()
+[![特色](https://free.picui.cn/free/4756/2026/09/14/6aa6d7625db96.jpg)]()
+[![文档](https://free.picui.cn/free/4756/2026/09/14/6aa6d7625db96.jpg)](https://lrcdb.auxilor.io/)
+[![兼容性](https://free.picui.cn/free/4756/2026/09/14/6aa6d7634efbe.jpg)]()
 
 ## License
 
