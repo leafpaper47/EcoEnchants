@@ -1,20 +1,23 @@
-# EcoEnchants fork —— 自动同步上游 + 自动构建（v5）
+# EcoEnchants fork —— 自动同步上游 + 自动构建 + 自动发 Release（v6）
 # 位置：fork 根目录 .github/workflows/build-release.yml（整份替换原内容）
 #
 # 触发：schedule（每天 UTC 18:00 = 北京 02:00）/ push master / push v* / 手动 Run workflow
 #
 # ⚠️ 一次性前置检查：Settings -> Actions -> General -> Workflow permissions
-#    必须选 "Read and write permissions"，否则 GITHUB_TOKEN 只读，git push 必被拒
-#    （被拒时 exit code 是 128，日志里会有 "Permission to ... denied"）
+#    必须选 "Read and write permissions"，否则 GITHUB_TOKEN 只读，push 与发 Release 都会被拒
+#    （push 被拒 exit code 128；Release 被拒 gh 会报 Resource not accessible / HTTP 403）
 #
-# v4 -> v5 改动
-#   1. 不再依赖 refs/remotes/upstream/master：改成 fetch 后取 FETCH_HEAD 的 SHA，直接 merge SHA
-#      （v4 用的是 git merge upstream/master，若跟踪引用没落地就会 "not something we can merge" → exit 1）
-#   2. 合并前先用 git merge-base --is-ancestor 判断上游是否真有新提交：
-#      没有就直接 changed=false 退出，不再做 amend/push（v4 会在无更新时也 amend 出一个空提交）
-#   3. 加 --no-ff，保证一定是真合并提交，剥离 workflow 的逻辑才成立
-#   4. push 失败单独捕获，报出「可能是 Workflow permissions 只读」
-#   5. 全程 ::group:: 分段，日志一眼能看出死在哪条命令
+# v5 -> v6 改动（因为「构建成功但没发 Release」）
+#   1. 根因：v5 的发布步骤写的是 if: startsWith(github.ref, 'refs/tags/')，
+#      而 push master / 手动触发的 ref 是 refs/heads/master → 永远 skipped。
+#   2. 换成 gh CLI 显式判断，三条路径都能发：
+#        push tag   -> 用该 tag 发（已存在则覆盖附件）
+#        push master-> 用 v<gradle.properties 里的 version> 发；该 Release 已存在则跳过（避免每天刷）
+#        Run workflow-> inputs.release = auto / always / never，默认 auto
+#   3. 版本号从 gradle.properties 的 version= 读，不再手填。
+#   4. sync/build 两个 job 加 github.actor != 'github-actions[bot]' 守卫：
+#      万一以后换成 PAT（SYNC_TOKEN），PAT 建的 tag 会再次触发 workflow，这个守卫直接掐断自激循环。
+#      （用 GITHUB_TOKEN 建 tag 本身不会触发新 run，守卫只是保险。）
 
 name: Sync & Build
 
@@ -25,6 +28,12 @@ on:
     branches: [ master ]
     tags: [ 'v*' ]
   workflow_dispatch:
+    inputs:
+      release:
+        description: '是否发布 Release（auto=该版本没有才发，always=强制覆盖，never=只出构件）'
+        type: choice
+        options: [ auto, always, never ]
+        default: auto
 
 permissions:
   contents: write
@@ -32,10 +41,12 @@ permissions:
 env:
   UPSTREAM_REPO: Auxilor/EcoEnchants
   UPSTREAM_BRANCH: master
+  TAG_PREFIX: 'v'
 
 jobs:
   # ---------- 1. 同步上游 ----------
   sync:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
       build: ${{ steps.decide.outputs.build }}
@@ -124,10 +135,10 @@ jobs:
             echo "build=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # ---------- 2. 构建 ----------
+  # ---------- 2. 构建 + 发 Release ----------
   build:
     needs: sync
-    if: needs.sync.outputs.build == 'true'
+    if: needs.sync.outputs.build == 'true' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -193,13 +204,79 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Read version
+        id: ver
+        if: success()
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -E '^version[[:space:]]*=' gradle.properties | head -1 | cut -d= -f2- | tr -d ' \r')
+          if [ -z "$VERSION" ]; then
+            echo "::error::未能从 gradle.properties 读到 version="
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG_PREFIX}${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "检测到版本：${TAG_PREFIX}${VERSION}"
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.jar
-          generate_release_notes: true
-          draft: false
+        id: release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_TAG: ${{ steps.ver.outputs.tag }}
+          INPUT_RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+
+          # ---- 决定 tag 与模式 ----
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${VERSION_TAG}"
+          fi
+
+          MODE="${INPUT_RELEASE:-}"
+          # auto / 未传值：按触发方式决定；tag 推送一律覆盖，其它情况该版本已发过就不重复发
+          if [ -z "$MODE" ] || [ "$MODE" = "auto" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              MODE=always
+            else
+              MODE=if-missing
+            fi
+          fi
+
+          echo "event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} → tag=${TAG} mode=${MODE}"
+
+          if [ "$MODE" = "never" ]; then
+            echo "⏭ 输入指定 never，只出构件不发 Release"
+            exit 0
+          fi
+
+          mapfile -t JARS < <(ls dist/*.jar 2>/dev/null || true)
+          if [ "${#JARS[@]}" -eq 0 ]; then
+            echo "::error::dist 目录里没有 jar，无法发布"
+            exit 1
+          fi
+          printf '待发布文件：%s\n' "${JARS[@]}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$MODE" = "if-missing" ]; then
+              echo "⏭ Release $TAG 已存在，跳过（避免每次同步都刷一条）"
+              exit 0
+            fi
+            echo "♻️ Release $TAG 已存在，覆盖附件"
+            gh release upload "$TAG" "${JARS[@]}" --clobber
+          else
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              echo "ℹ️ tag $TAG 已存在但还没 Release，直接建 Release"
+              gh release create "$TAG" "${JARS[@]}" --title "$TAG" --generate-notes
+            else
+              echo "🆕 新建 tag $TAG 并发布 Release"
+              gh release create "$TAG" "${JARS[@]}" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
+            fi
+          fi
+
+          echo "✅ Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
 
 # ─────────────────────────────────────────────────────────────
 # 可选升级：连上游对 workflow 文件的改动一起同步
