@@ -1,4 +1,4 @@
-# EcoEnchants fork —— 自动同步上游 + 自动构建 + 自动发 Release（v6）
+# EcoEnchants fork —— 自动同步上游 + 自动构建 + 自动发 Release（v7）
 # 位置：fork 根目录 .github/workflows/build-release.yml（整份替换原内容）
 #
 # 触发：schedule（每天 UTC 18:00 = 北京 02:00）/ push master / push v* / 手动 Run workflow
@@ -18,6 +18,17 @@
 #   4. sync/build 两个 job 加 github.actor != 'github-actions[bot]' 守卫：
 #      万一以后换成 PAT（SYNC_TOKEN），PAT 建的 tag 会再次触发 workflow，这个守卫直接掐断自激循环。
 #      （用 GITHUB_TOKEN 建 tag 本身不会触发新 run，守卫只是保险。）
+#
+# v6 -> v7 改动（为了保住 README 顶部的免责声明）
+#   1. merge 加 -X ours：上游若也改了 README，冲突默认保留 fork 这侧，不会因冲突让同步失败，
+#      也不会把免责声明冲掉；上游对 README 其它段落的改动照常合并。
+#   2. 「剥离 .github/workflows」逻辑改成无条件执行：以前用 git cat-file 做门控，
+#      如果 fork 里整个目录都被删了就会跳过还原，导致上游的 workflow 改动进入待推列表 → push 被拒。
+#      现在无论 before 有没有该目录，都把工作区还原成合并前的样子。
+#   3. 补 modify/delete 冲突兜底：你在 fork 里删了 workflow 文件、上游又改了同一个文件时，
+#      -X ours 不生效（git 报 CONFLICT (modify/delete)）。现在检测到 .github/workflows 内的
+#      未合并路径就按「合并前状态」解决并完成合并；其它文件的冲突照旧报错退出，不静默吞掉。
+#   4. 合并后自检 README 里的免责声明是否还在，日志里直接给结论。
 
 name: Sync & Build
 
@@ -94,19 +105,55 @@ jobs:
           fi
 
           echo "::group::merge upstream"
-          if ! git merge --no-ff --no-edit "$upstream_sha"; then
-            echo "::error::与上游合并冲突，请在本地 git fetch upstream && git merge upstream/master 处理后再推上来"
-            git merge --abort || true
-            exit 1
+          # -X ours：内容冲突时保留 fork 这侧 —— 用来保住 README 顶部的免责声明。
+          # 这是全局策略，但只在「两边同时改了同一处」时才生效；本地改动只有 README.md
+          # （.github/workflows 会在下一步被还原），所以影响范围可控。
+          if ! git merge --no-ff --no-edit -X ours "$upstream_sha"; then
+            # 唯一预期内的冲突来源是 .github/workflows：比如你在 fork 里删了上游又改过的文件
+            # （modify/delete 冲突，-X ours 处理不了）。这部分无论如何都会被还原成「合并前状态」，
+            # 所以直接按 ours 解决掉，把合并做完。
+            if [ -n "$(git ls-files -u -- .github/workflows)" ]; then
+              echo "ℹ️ .github/workflows 存在冲突 → 按合并前状态解决"
+              git rm -r -f --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+              if git cat-file -e "${before}:.github/workflows" 2>/dev/null; then
+                git checkout "${before}" -- .github/workflows
+              fi
+              git add -A .github/workflows 2>/dev/null || true
+            fi
+            if [ -n "$(git ls-files -u)" ]; then
+              echo "::error::与上游存在冲突，且不在 .github/workflows 内，请本地 git fetch upstream && git merge upstream/master 处理后再推上来："
+              git ls-files -u | head -20
+              git merge --abort || true
+              exit 1
+            fi
+            if [ ! -f .git/MERGE_HEAD ]; then
+              echo "::error::合并失败且没有进行中的合并，请看上面的 git 输出"
+              exit 1
+            fi
+            git commit --no-edit >/dev/null
+            echo "ℹ️ 已按 ours 策略解决 workflow 冲突并完成合并"
           fi
           echo "::endgroup::"
 
-          # 剥离 .github/workflows：默认 token 无权推送 workflow 文件改动
+          echo "::group::strip workflows"
+          # 默认 token 无权推送 .github/workflows 下的任何改动 → 一律把该目录还原成「合并前」的样子。
+          # 合并前如果 fork 里就没这个目录（例如你把它们删了），就保持删除状态。
+          git rm -r -f --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
           if git cat-file -e "${before}:.github/workflows" 2>/dev/null; then
-            git rm -r -f --ignore-unmatch .github/workflows
             git checkout "${before}" -- .github/workflows
+          fi
+          if ! git diff --cached --quiet; then
             git commit --amend --no-edit >/dev/null
             echo "ℹ️ 已把 .github/workflows 还原为合并前状态"
+          else
+            echo "ℹ️ .github/workflows 无变化，无需还原"
+          fi
+          echo "::endgroup::"
+
+          if grep -q "个人 fork" README.md 2>/dev/null; then
+            echo "✅ README 免责声明在位"
+          else
+            echo "⚠️ README 里没找到免责声明，请确认 fork 的 README.md 顶部还在"
           fi
 
           after=$(git rev-parse HEAD)
@@ -285,6 +332,9 @@ jobs:
 #      Permissions: Contents = Read and write，Workflows = Read and write
 #   2. fork -> Settings -> Secrets and variables -> Actions -> New repository secret
 #      名字 SYNC_TOKEN，值 github_pat_xxx
-#   3. 删掉上面「剥离 .github/workflows」那段 if 块
+#   3. 删掉上面「剥离 .github/workflows」那段
 #   token 必须传给 actions/checkout 的 token: 输入，传给 git push 步骤无效。
+#
+# ⚠️ 用了 SYNC_TOKEN（PAT）之后：PAT 建的 tag 会再次触发 workflow。
+#    已有 github.actor != 'github-actions[bot]' 守卫兜底，正常不会自激。
 # ─────────────────────────────────────────────────────────────
